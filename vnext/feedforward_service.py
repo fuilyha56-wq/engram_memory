@@ -124,6 +124,8 @@ class FeedForwardSettings:
     mismatch_penalty: float = 0.6
     working_weight: float = 0.8
     kda_weight: float = 0.6
+    recency_weight: float = 1.5
+    inhibition_weight: float = 0.6
     relevance_floor: float = 0.0
     latency_budget_ms: int = 1500
     channels: dict[str, ChannelSettings] = field(
@@ -166,6 +168,8 @@ class FeedForwardCue:
     person_ids: tuple[str, ...]
     chat_type: str
     now: datetime
+    #: 最新一条输入文本；为空时退回使用 text 整体
+    latest_text: str = ""
 
     @property
     def channel(self) -> str:
@@ -183,6 +187,7 @@ class _CandidateFacts:
     memory_kind: str
     person_ids: tuple[str, ...]
     chat_types: tuple[str, ...]
+    source_scopes: tuple[tuple[str, str], ...]
     source_types: tuple[str, ...]
     access_times: tuple[datetime, ...]
     experienced_at: datetime
@@ -196,6 +201,7 @@ class _CandidateFacts:
             "memory_kind": self.memory_kind,
             "person_ids": list(self.person_ids),
             "chat_types": list(self.chat_types),
+            "source_scopes": [list(item) for item in self.source_scopes],
             "source_types": list(self.source_types),
             "access_times": [item.isoformat() for item in self.access_times],
             "experienced_at": self.experienced_at.isoformat(),
@@ -211,6 +217,11 @@ class _CandidateFacts:
             memory_kind=str(payload["memory_kind"]),
             person_ids=tuple(str(item) for item in payload["person_ids"]),  # type: ignore[union-attr]
             chat_types=tuple(str(item) for item in payload["chat_types"]),  # type: ignore[union-attr]
+            source_scopes=tuple(
+                (str(item[0]), str(item[1]))
+                for item in payload.get("source_scopes", [])  # type: ignore[union-attr]
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ),
             source_types=tuple(str(item) for item in payload["source_types"]),  # type: ignore[union-attr]
             access_times=tuple(
                 datetime.fromisoformat(str(item)) for item in payload["access_times"]  # type: ignore[union-attr]
@@ -342,6 +353,7 @@ class FeedForwardRetrievalService:
         sensory = self.layers.sensory(stream_id, current)
         if sensory:
             text = "\n".join(item.text for item in sensory)
+            latest = sensory[-1].text
             people = tuple(
                 dict.fromkeys(
                     item.person_id
@@ -350,7 +362,9 @@ class FeedForwardRetrievalService:
                 )
             )
         else:
-            text = "\n".join(piece.strip() for piece in fallback_turns if piece.strip())
+            pieces = [piece.strip() for piece in fallback_turns if piece.strip()]
+            text = "\n".join(pieces)
+            latest = pieces[-1] if pieces else ""
             people = ()
         if not text.strip():
             return None
@@ -360,6 +374,7 @@ class FeedForwardRetrievalService:
             person_ids=people,
             chat_type=chat_type,
             now=current,
+            latest_text=latest,
         )
 
     async def feed_forward(self, cue: FeedForwardCue) -> FeedForwardResult:
@@ -385,7 +400,11 @@ class FeedForwardRetrievalService:
         turn = self._turns[cue.stream_id]
         self._turns[cue.stream_id] = turn + 1
         retrieved = await self._retrieval.search(
-            RetrievalQuery(text=cue.text, top_k=self._settings.candidate_limit)
+            RetrievalQuery(
+                text=cue.text,
+                top_k=self._settings.candidate_limit,
+                person_ids=cue.person_ids,
+            )
         )
         similarity = {
             item.memory_id: max(0.0, float(item.vector_similarity or 0.0))
@@ -396,7 +415,29 @@ class FeedForwardRetrievalService:
             for item in retrieved
             if item.lexical_rank is not None
         }
+        latest_text = cue.latest_text.strip()
+        recency: dict[str, float] = {}
+        if latest_text and latest_text != cue.text.strip():
+            for item in await self._retrieval.search(
+                RetrievalQuery(
+                    text=latest_text,
+                    top_k=self._settings.candidate_limit,
+                    person_ids=cue.person_ids,
+                )
+            ):
+                score = max(
+                    float(item.vector_similarity or 0.0),
+                    1.0 / (1.0 + item.lexical_rank) if item.lexical_rank is not None else 0.0,
+                )
+                recency[item.memory_id] = max(0.0, score)
+                similarity.setdefault(item.memory_id, 0.0)
+        elif latest_text:
+            recency = {
+                memory_id: max(similarity.get(memory_id, 0.0), lexical.get(memory_id, 0.0))
+                for memory_id in {*similarity, *lexical}
+            }
         working = self.layers.working_bonus(cue.stream_id, turn)
+        rehearsals = self.layers.rehearsal_counts(cue.stream_id)
         pool = tuple(
             dict.fromkeys(
                 (
@@ -407,11 +448,16 @@ class FeedForwardRetrievalService:
             )
         )
         facts = await self._load_facts(pool, cue.now)
+        facts = {
+            memory_id: fact
+            for memory_id, fact in facts.items()
+            if self._candidate_in_scope(fact, cue)
+        }
         if not facts:
             return FeedForwardResult(selected=(), candidate_count=0, gates={})
 
         dim = self._settings.feature_dim
-        cue_tokens = _tokenize(cue.text)
+        cue_tokens = _tokenize(cue.latest_text or cue.text)
         cue_key = hashed_features(cue_tokens, dim, salt="cue")
         values = {
             memory_id: self._value_vector(memory_id) for memory_id in facts
@@ -431,6 +477,7 @@ class FeedForwardRetrievalService:
                 (self._settings.kda_weight, kda_scores.get(memory_id, 0.0)),
                 (1.0, similarity.get(memory_id, 0.0)),
                 (0.5, lexical.get(memory_id, 0.0)),
+                (self._settings.recency_weight, recency.get(memory_id, 0.0)),
             ]
             if cue.person_ids and set(cue.person_ids) & set(fact.person_ids):
                 associations.append((0.6, 1.0))
@@ -439,6 +486,12 @@ class FeedForwardRetrievalService:
                 mismatches.append(
                     1.0 if set(cue.person_ids) & set(fact.person_ids) else 0.0
                 )
+            # 返回抑制：本轮新线索不指向它时，连续复述越多越让位
+            inhibition = (
+                -self._settings.inhibition_weight * math.log1p(rehearsals.get(memory_id, 0))
+                if recency.get(memory_id, 0.0) <= 0.0
+                else 0.0
+            )
             components[memory_id] = self.actr.activation(
                 access_times=fact.access_times,
                 now=cue.now,
@@ -446,6 +499,7 @@ class FeedForwardRetrievalService:
                 mismatches=mismatches,
                 noise_unit=self._noise_unit(cue, memory_id, turn),
                 decay=decay,
+                extra=inhibition,
             )
 
         query_views, gates = self._query_views(cue, cue_tokens)
@@ -474,7 +528,7 @@ class FeedForwardRetrievalService:
             memory_id: parts
             for memory_id, parts in final.items()
             if self._is_relevant(
-                memory_id, similarity, lexical, working, kda_scores, cue, facts
+                memory_id, similarity, lexical, working, kda_scores, recency, cue, facts
             )
         }
         chosen = (
@@ -510,6 +564,7 @@ class FeedForwardRetrievalService:
         lexical: dict[str, float],
         working: dict[str, float],
         kda_scores: dict[str, float],
+        recency: dict[str, float],
         cue: FeedForwardCue,
         facts: dict[str, _CandidateFacts],
     ) -> bool:
@@ -519,9 +574,26 @@ class FeedForwardRetrievalService:
             lexical.get(memory_id, 0.0),
             working.get(memory_id, 0.0),
             kda_scores.get(memory_id, 0.0),
+            recency.get(memory_id, 0.0),
             1.0 if set(cue.person_ids) & set(facts[memory_id].person_ids) else 0.0,
         )
         return evidence > self._settings.relevance_floor
+
+    @staticmethod
+    def _candidate_in_scope(fact: _CandidateFacts, cue: FeedForwardCue) -> bool:
+        """禁止跨人物、跨私聊或跨群聊注入正式记忆。"""
+        if cue.person_ids and fact.person_ids and not set(fact.person_ids).intersection(
+            cue.person_ids
+        ):
+            return False
+        if fact.source_scopes:
+            return any(
+                chat_type == cue.chat_type and stream_id == cue.stream_id
+                for chat_type, stream_id in fact.source_scopes
+            )
+        if fact.person_ids and not fact.source_scopes:
+            return cue.chat_type == "private"
+        return True
 
     def _consolidate(
         self,
@@ -695,6 +767,7 @@ class FeedForwardRetrievalService:
                     people[revision_id].add(person_id)
             sources: defaultdict[str, set[str]] = defaultdict(set)
             chat_types: defaultdict[str, set[str]] = defaultdict(set)
+            source_scopes: defaultdict[str, set[tuple[str, str]]] = defaultdict(set)
             redacted: set[str] = set()
             for revision_id, source_type, payload, redacted_at in (
                 await session.execute(
@@ -730,6 +803,9 @@ class FeedForwardRetrievalService:
                     chat_type = payload.get("chat_type")
                     if isinstance(chat_type, str) and chat_type:
                         chat_types[revision_id].add(chat_type)
+                        stream_id = payload.get("stream_id")
+                        if isinstance(stream_id, str) and stream_id:
+                            source_scopes[revision_id].add((chat_type, stream_id))
             accesses: defaultdict[str, list[datetime]] = defaultdict(list)
             for memory_id, occurred_at in (
                 await session.execute(
@@ -758,6 +834,7 @@ class FeedForwardRetrievalService:
                 ),
                 person_ids=tuple(sorted(people.get(row.revision_id, ()))),
                 chat_types=tuple(sorted(chat_types.get(row.revision_id, ()))),
+                source_scopes=tuple(sorted(source_scopes.get(row.revision_id, ()))),
                 source_types=tuple(sorted(sources.get(row.revision_id, ()))),
                 access_times=tuple(
                     sorted({row.created_at, experienced, *accesses.get(row.memory_id, ())})
